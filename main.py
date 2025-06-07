@@ -1,55 +1,115 @@
+import os
+import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
+    MessageHandler, ContextTypes, filters
 )
-import aiohttp
 
-BOT_TOKEN = "7721304293:AAESzxmIppuurX-_9XEd4fcxkeRHsmtkYMo"
-CHANNEL_ID = -1002185480944
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY")
 ADMIN_ID = 813287836
+CHANNEL_ID = -1002185480944
+
 TRC20_ADDRESS = "TSViFWncAuWxL1ADua7VwCk96gxAbL8TzS"
 BEP20_ADDRESS = "0x4a3E77d046A89121D0911E132C938b2077ad3E00"
 USDT_AMOUNT = 279
 
-# В этом коде проверка транзакции не реализована, только шаблон
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [
-            InlineKeyboardButton(f"TRC20: `{TRC20_ADDRESS}`", callback_data="trc20"),
-            InlineKeyboardButton(f"BEP20: `{BEP20_ADDRESS}`", callback_data="bep20"),
-        ],
-        [InlineKeyboardButton("✅ Я оплатил", callback_data="paid")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        f"Оплата подписки — {USDT_AMOUNT} USDT (пожизненно)\n\n"
-        "Оплатите на любой из адресов ниже (клик по адресу скопирует его):",
-        reply_markup=reply_markup,
-        parse_mode="MarkdownV2"
+    keyboard = [[InlineKeyboardButton("✅ Я оплатил", callback_data="paid")]]
+    text = (
+        f"💳 Оплата подписки — *{USDT_AMOUNT} USDT* (пожизненно)\n\n"
+        f"Отправьте *точно* {USDT_AMOUNT} USDT на *любой* из адресов ниже:\n\n"
+        f"`TRC20:` `{TRC20_ADDRESS}`\n"
+        f"`BEP20:` `{BEP20_ADDRESS}`\n\n"
+        "После оплаты нажмите кнопку ниже 👇"
     )
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
 
 async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "paid":
-        await query.message.reply_text(
-            "Отправьте TX ID (хеш транзакции) для проверки оплаты."
-        )
-        return
-    # Просто подтверждаем выбор адреса, если нужно
-    await query.message.reply_text(f"Вы выбрали: {query.data}")
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("Пожалуйста, отправьте хеш (TX ID) вашей транзакции.")
+
 
 async def handle_tx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tx_id = update.message.text.strip()
-    # Здесь должна быть проверка транзакции через API (Tronscan или BscScan)
-    # Пока заглушка
-    await update.message.reply_text(
-        f"Спасибо! Проверка транзакции {tx_id} пока не реализована.\n"
-        "Как только оплата подтвердится, вы будете добавлены в канал."
+
+    if not tx_id:
+        await update.message.reply_text("❌ Пожалуйста, отправьте корректный хеш транзакции.")
+        return
+
+    msg = await update.message.reply_text("🔍 Проверяю транзакцию, подождите...")
+
+    # Проверка TRC20
+    if len(tx_id) == 64:
+        result = await check_trc20(tx_id)
+    # Проверка BEP20
+    elif tx_id.startswith("0x") and len(tx_id) == 66:
+        result = await check_bep20(tx_id)
+    else:
+        await msg.edit_text("❌ Неверный формат TX ID. Убедитесь, что вы отправили корректный хеш.")
+        return
+
+    if result["status"]:
+        await msg.edit_text("✅ Платёж подтверждён! Вас скоро добавят в канал.")
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"💰 Оплата подтверждена:\n\nTX: `{tx_id}`\nUser: @{update.effective_user.username}",
+            parse_mode="Markdown"
+        )
+    else:
+        await msg.edit_text(f"❌ Платёж не найден или недостаточная сумма.\n\nДетали: {result['message']}")
+
+
+async def check_trc20(tx_id):
+    url = f"https://apilist.tronscanapi.com/api/transaction-info?hash={tx_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                if not data.get("contractRet") == "SUCCESS":
+                    return {"status": False, "message": "Транзакция не найдена или не успешна"}
+
+                token_info = data.get("tokenTransferInfo", {})
+                if (
+                    token_info.get("to_address", "").lower() == TRC20_ADDRESS.lower() and
+                    float(token_info.get("amount_str", "0")) / (10 ** 6) >= USDT_AMOUNT
+                ):
+                    return {"status": True}
+                return {"status": False, "message": "Адрес получателя или сумма не совпадают"}
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
+
+async def check_bep20(tx_id):
+    url = (
+        f"https://api.bscscan.com/api"
+        f"?module=account&action=tokentx&txhash={tx_id}&apikey={BSCSCAN_API_KEY}"
     )
-    # Тут можно добавить логику добавления пользователя в канал через API Telegram
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                txs = data.get("result", [])
+                if not txs:
+                    return {"status": False, "message": "Транзакция не найдена"}
+
+                for tx in txs:
+                    if (
+                        tx["to"].lower() == BEP20_ADDRESS.lower() and
+                        tx["value"] and
+                        int(tx["value"]) / (10 ** int(tx["tokenDecimal"])) >= USDT_AMOUNT and
+                        tx["tokenSymbol"] == "USDT"
+
+):
+                        return {"status": True}
+
+                return {"status": False, "message": "Адрес получателя или сумма не совпадают"}
+    except Exception as e:
+        return {"status": False, "message": str(e)}
+
 
 if name == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
